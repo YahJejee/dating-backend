@@ -104,7 +104,38 @@ async function ensureTables() {
     );
   `);
 
-  console.log('Users, Profiles, Preferences tables are ready');
+  // Likes table (one-directional "like")
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS likes (
+      liker_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      liked_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (liker_id, liked_id)
+    );
+  `);
+
+  // Passes table (one-directional "pass")
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS passes (
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      target_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (user_id, target_user_id)
+    );
+  `);
+
+  // Matches table (mutual like)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id SERIAL PRIMARY KEY,
+      user1_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      user2_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (user1_id, user2_id)
+    );
+  `);
+
+  console.log('Users, Profiles, Preferences, Likes, Passes, Matches tables are ready');
 }
 
 // ---------- Helper functions ----------
@@ -193,6 +224,18 @@ function mapPreferencesRow(row) {
     preferredCities: row.preferred_cities || [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+// Map DB match row -> API response
+function mapMatchRow(row) {
+  if (!row) return null;
+  return {
+    matchId: row.match_id,
+    userId: row.other_user_id,
+    email: row.other_email,
+    fullName: row.other_full_name,
+    createdAt: row.match_created_at,
   };
 }
 
@@ -455,7 +498,7 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- Preferences endpoints (Step 2) ----------
+// ---------- Preferences endpoints ----------
 
 // Get my preferences
 app.get('/me/preferences', authMiddleware, async (req, res) => {
@@ -564,6 +607,169 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
     res.json({ preferences: mapPreferencesRow(prefs) });
   } catch (err) {
     console.error('Error in PUT /me/preferences', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------- Likes / Passes / Matches endpoints ----------
+
+// Like someone
+app.post('/swipes/like', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  try {
+    const { targetUserId } = req.body;
+    const currentUserId = req.user.id;
+
+    if (!targetUserId || typeof targetUserId !== 'number') {
+      return res.status(400).json({ error: 'targetUserId (number) is required' });
+    }
+
+    if (targetUserId === currentUserId) {
+      return res.status(400).json({ error: 'You cannot like yourself' });
+    }
+
+    // Ensure target user exists
+    const userCheck = await pool.query(
+      'SELECT id FROM users WHERE id = $1',
+      [targetUserId]
+    );
+    if (userCheck.rowCount === 0) {
+      return res.status(404).json({ error: 'Target user not found' });
+    }
+
+    // Record the like (ignore if already liked)
+    await pool.query(
+      `
+      INSERT INTO likes (liker_id, liked_id)
+      VALUES ($1, $2)
+      ON CONFLICT (liker_id, liked_id) DO NOTHING;
+      `,
+      [currentUserId, targetUserId]
+    );
+
+    // Check if the other user already liked this user (mutual like)
+    const mutual = await pool.query(
+      'SELECT 1 FROM likes WHERE liker_id = $1 AND liked_id = $2',
+      [targetUserId, currentUserId]
+    );
+
+    let isMatch = false;
+    let matchId = null;
+
+    if (mutual.rowCount > 0) {
+      // Order user IDs to keep unique constraint stable
+      const user1 = Math.min(currentUserId, targetUserId);
+      const user2 = Math.max(currentUserId, targetUserId);
+
+      const matchResult = await pool.query(
+        `
+        INSERT INTO matches (user1_id, user2_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user1_id, user2_id) DO UPDATE SET user1_id = matches.user1_id
+        RETURNING id, created_at;
+        `,
+        [user1, user2]
+      );
+
+      isMatch = true;
+      matchId = matchResult.rows[0].id;
+    }
+
+    res.json({
+      status: 'liked',
+      isMatch,
+      matchId,
+    });
+  } catch (err) {
+    console.error('Error in POST /swipes/like', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Pass on someone
+app.post('/swipes/pass', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  try {
+    const { targetUserId } = req.body;
+    const currentUserId = req.user.id;
+
+    if (!targetUserId || typeof targetUserId !== 'number') {
+      return res.status(400).json({ error: 'targetUserId (number) is required' });
+    }
+
+    if (targetUserId === currentUserId) {
+      return res.status(400).json({ error: 'You cannot pass on yourself' });
+    }
+
+    // Ensure target user exists
+    const userCheck = await pool.query(
+      'SELECT id FROM users WHERE id = $1',
+      [targetUserId]
+    );
+    if (userCheck.rowCount === 0) {
+      return res.status(404).json({ error: 'Target user not found' });
+    }
+
+    // Record the pass (ignore if already passed)
+    await pool.query(
+      `
+      INSERT INTO passes (user_id, target_user_id)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id, target_user_id) DO NOTHING;
+      `,
+      [currentUserId, targetUserId]
+    );
+
+    res.json({ status: 'passed' });
+  } catch (err) {
+    console.error('Error in POST /swipes/pass', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get my matches
+app.get('/matches', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  try {
+    const currentUserId = req.user.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        m.id AS match_id,
+        m.created_at AS match_created_at,
+        CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END AS other_user_id,
+        u.email AS other_email,
+        u.full_name AS other_full_name
+      FROM matches m
+      JOIN users u
+        ON u.id = CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END
+      WHERE m.user1_id = $1 OR m.user2_id = $1
+      ORDER BY m.created_at DESC;
+      `,
+      [currentUserId]
+    );
+
+    const matches = result.rows.map(mapMatchRow);
+
+    res.json({ matches });
+  } catch (err) {
+    console.error('Error in GET /matches', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
