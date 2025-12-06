@@ -53,25 +53,19 @@ async function ensureTables() {
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       gender TEXT CHECK (gender IN ('male','female')),
       date_of_birth DATE,
-
       country TEXT,
       city TEXT,
       religion TEXT,
       sect TEXT,
-
-      marital_status TEXT, -- e.g. 'single','divorced','widowed','separated'
-
+      marital_status TEXT,
       has_children BOOLEAN,
       wants_children BOOLEAN,
-
       education_level TEXT,
       occupation TEXT,
       income_range TEXT,
-
       languages TEXT[],
       bio TEXT,
       interests TEXT[],
-
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -81,24 +75,17 @@ async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS preferences (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-
       preferred_gender TEXT CHECK (preferred_gender IN ('male','female') OR preferred_gender IS NULL),
-
       min_age INTEGER,
       max_age INTEGER,
-
       preferred_religions TEXT[],
       preferred_sects TEXT[],
       preferred_marital_statuses TEXT[],
-
       accept_has_children BOOLEAN,
       wants_children BOOLEAN,
-
       max_distance_km INTEGER,
-
       preferred_countries TEXT[],
       preferred_cities TEXT[],
-
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -237,6 +224,107 @@ function mapMatchRow(row) {
     fullName: row.other_full_name,
     createdAt: row.match_created_at,
   };
+}
+
+// Compute age from a DATE string (e.g. "1990-05-21")
+function computeAge(dateOfBirth) {
+  if (!dateOfBirth) return null;
+  const dob = new Date(dateOfBirth);
+  if (Number.isNaN(dob.getTime())) return null;
+  const today = new Date();
+  let age = today.getFullYear() - dob.getFullYear();
+  const m = today.getMonth() - dob.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) {
+    age--;
+  }
+  return age;
+}
+
+// Basic matching score between my prefs/profile and candidate profile
+function computeMatchScore(myProfile, myPrefs, candidateProfile) {
+  let score = 0;
+
+  // Hard constraints (return -1 if not acceptable)
+  const candidateAge = computeAge(candidateProfile.date_of_birth);
+  if (myPrefs.min_age != null && candidateAge != null && candidateAge < myPrefs.min_age) {
+    return -1;
+  }
+  if (myPrefs.max_age != null && candidateAge != null && candidateAge > myPrefs.max_age) {
+    return -1;
+  }
+
+  if (myPrefs.preferred_gender && candidateProfile.gender) {
+    if (candidateProfile.gender !== myPrefs.preferred_gender) return -1;
+  }
+
+  if (myPrefs.preferred_religions && myPrefs.preferred_religions.length > 0) {
+    if (!candidateProfile.religion || !myPrefs.preferred_religions.includes(candidateProfile.religion)) {
+      return -1;
+    }
+  }
+
+  if (myPrefs.preferred_marital_statuses && myPrefs.preferred_marital_statuses.length > 0) {
+    if (!candidateProfile.marital_status || !myPrefs.preferred_marital_statuses.includes(candidateProfile.marital_status)) {
+      return -1;
+    }
+  }
+
+  if (myPrefs.accept_has_children === false && candidateProfile.has_children === true) {
+    return -1;
+  }
+
+  if (myPrefs.wants_children === true && candidateProfile.wants_children === false) {
+    return -1;
+  }
+
+  // Soft scoring
+
+  // Age closeness
+  if (candidateAge != null && myPrefs.min_age != null && myPrefs.max_age != null) {
+    const mid = (myPrefs.min_age + myPrefs.max_age) / 2;
+    const diff = Math.abs(candidateAge - mid);
+    score += Math.max(0, 20 - diff); // up to 20 points, less if far from ideal
+  }
+
+  // Same country / preferred countries
+  if (myPrefs.preferred_countries && myPrefs.preferred_countries.length > 0) {
+    if (candidateProfile.country && myPrefs.preferred_countries.includes(candidateProfile.country)) {
+      score += 15;
+    }
+  } else if (myProfile.country && candidateProfile.country && myProfile.country === candidateProfile.country) {
+    score += 10;
+  }
+
+  // Same city
+  if (myProfile.city && candidateProfile.city && myProfile.city === candidateProfile.city) {
+    score += 10;
+  }
+
+  // Same religion / sect
+  if (myProfile.religion && candidateProfile.religion && myProfile.religion === candidateProfile.religion) {
+    score += 10;
+  }
+  if (myProfile.sect && candidateProfile.sect && myProfile.sect === candidateProfile.sect) {
+    score += 5;
+  }
+
+  // Interests overlap
+  const myInterests = myProfile.interests || [];
+  const candInterests = candidateProfile.interests || [];
+  if (myInterests.length > 0 && candInterests.length > 0) {
+    const overlap = myInterests.filter((i) => candInterests.includes(i));
+    score += overlap.length * 3; // 3 pts per shared interest
+  }
+
+  // Languages overlap
+  const myLangs = myProfile.languages || [];
+  const candLangs = candidateProfile.languages || [];
+  if (myLangs.length > 0 && candLangs.length > 0) {
+    const overlapLang = myLangs.filter((l) => candLangs.includes(l));
+    score += overlapLang.length * 2;
+  }
+
+  return score;
 }
 
 // ---------- Public endpoints ----------
@@ -660,7 +748,6 @@ app.post('/swipes/like', authMiddleware, async (req, res) => {
     let matchId = null;
 
     if (mutual.rowCount > 0) {
-      // Order user IDs to keep unique constraint stable
       const user1 = Math.min(currentUserId, targetUserId);
       const user2 = Math.max(currentUserId, targetUserId);
 
@@ -770,6 +857,100 @@ app.get('/matches', authMiddleware, async (req, res) => {
     res.json({ matches });
   } catch (err) {
     console.error('Error in GET /matches', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------- Suggestions endpoint (matching engine) ----------
+
+app.get('/suggestions', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  const currentUserId = req.user.id;
+  const limit = Number.parseInt(req.query.limit || '20', 10);
+
+  try {
+    // Load my profile & preferences
+    const [profileResult, prefsResult] = await Promise.all([
+      pool.query('SELECT * FROM profiles WHERE user_id = $1', [currentUserId]),
+      pool.query('SELECT * FROM preferences WHERE user_id = $1', [currentUserId]),
+    ]);
+
+    const myProfileRow = profileResult.rows[0];
+    const myPrefsRow = prefsResult.rows[0];
+
+    if (!myProfileRow) {
+      return res.status(400).json({ error: 'Profile not set. Please complete your profile first.' });
+    }
+    if (!myPrefsRow) {
+      return res.status(400).json({ error: 'Preferences not set. Please set your preferences first.' });
+    }
+
+    const myProfile = myProfileRow;
+    const myPrefs = myPrefsRow;
+
+    // Get candidate users with profiles, excluding:
+    // - myself
+    // - users I've already liked
+    // - users I've already passed
+    const candidatesResult = await pool.query(
+      `
+      SELECT
+        u.id AS user_id,
+        u.email,
+        u.full_name,
+        p.*
+      FROM users u
+      JOIN profiles p ON p.user_id = u.id
+      WHERE u.id != $1
+        AND NOT EXISTS (
+          SELECT 1 FROM likes l
+          WHERE l.liker_id = $1 AND l.liked_id = u.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM passes ps
+          WHERE ps.user_id = $1 AND ps.target_user_id = u.id
+        );
+      `,
+      [currentUserId]
+    );
+
+    const candidates = candidatesResult.rows;
+
+    const scored = candidates
+      .map((row) => {
+        const candidateProfile = row;
+        const score = computeMatchScore(myProfile, myPrefs, candidateProfile);
+        return { row, score };
+      })
+      .filter((item) => item.score >= 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+
+    const suggestions = scored.map(({ row, score }) => ({
+      userId: row.user_id,
+      fullName: row.full_name,
+      email: row.email, // you may hide this later for privacy
+      gender: row.gender,
+      age: computeAge(row.date_of_birth),
+      country: row.country,
+      city: row.city,
+      religion: row.religion,
+      sect: row.sect,
+      maritalStatus: row.marital_status,
+      hasChildren: row.has_children,
+      wantsChildren: row.wants_children,
+      interests: row.interests || [],
+      languages: row.languages || [],
+      bio: row.bio,
+      matchScore: score,
+    }));
+
+    res.json({ suggestions });
+  } catch (err) {
+    console.error('Error in GET /suggestions', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
