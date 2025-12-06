@@ -52,8 +52,6 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS profiles (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       gender TEXT CHECK (gender IN ('male','female')),
-
-      -- ISO date string, e.g. 1990-05-21
       date_of_birth DATE,
 
       country TEXT,
@@ -66,20 +64,47 @@ async function ensureTables() {
       has_children BOOLEAN,
       wants_children BOOLEAN,
 
-      education_level TEXT, -- e.g. 'high_school','bachelor','master','phd'
+      education_level TEXT,
       occupation TEXT,
       income_range TEXT,
 
-      languages TEXT[],     -- e.g. ['Arabic','English']
+      languages TEXT[],
       bio TEXT,
-      interests TEXT[],     -- e.g. ['travel','music','reading'],
+      interests TEXT[],
 
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
-  console.log('Users and Profiles tables are ready');
+  // Preferences table (1–1 with users)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS preferences (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+
+      preferred_gender TEXT CHECK (preferred_gender IN ('male','female') OR preferred_gender IS NULL),
+
+      min_age INTEGER,
+      max_age INTEGER,
+
+      preferred_religions TEXT[],
+      preferred_sects TEXT[],
+      preferred_marital_statuses TEXT[],
+
+      accept_has_children BOOLEAN,
+      wants_children BOOLEAN,
+
+      max_distance_km INTEGER,
+
+      preferred_countries TEXT[],
+      preferred_cities TEXT[],
+
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  console.log('Users, Profiles, Preferences tables are ready');
 }
 
 // ---------- Helper functions ----------
@@ -131,7 +156,7 @@ function mapProfileRow(row) {
   return {
     userId: row.user_id,
     gender: row.gender,
-    dateOfBirth: row.date_of_birth, // ISO date from PG
+    dateOfBirth: row.date_of_birth,
     country: row.country,
     city: row.city,
     religion: row.religion,
@@ -145,6 +170,27 @@ function mapProfileRow(row) {
     languages: row.languages || [],
     bio: row.bio,
     interests: row.interests || [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// Map DB preferences row -> API response
+function mapPreferencesRow(row) {
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    preferredGender: row.preferred_gender,
+    minAge: row.min_age,
+    maxAge: row.max_age,
+    preferredReligions: row.preferred_religions || [],
+    preferredSects: row.preferred_sects || [],
+    preferredMaritalStatuses: row.preferred_marital_statuses || [],
+    acceptHasChildren: row.accept_has_children,
+    wantsChildren: row.wants_children,
+    maxDistanceKm: row.max_distance_km,
+    preferredCountries: row.preferred_countries || [],
+    preferredCities: row.preferred_cities || [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -294,7 +340,7 @@ app.get('/me', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- Profile endpoints (Step 1) ----------
+// ---------- Profile endpoints ----------
 
 // Get my profile
 app.get('/me/profile', authMiddleware, async (req, res) => {
@@ -340,12 +386,10 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
       interests,
     } = req.body;
 
-    // Optional basic validation
     if (gender && !['male', 'female'].includes(gender)) {
       return res.status(400).json({ error: 'gender must be "male" or "female"' });
     }
 
-    // languages/interests should be arrays or undefined
     const languagesArr = Array.isArray(languages) ? languages : null;
     const interestsArr = Array.isArray(interests) ? interests : null;
 
@@ -407,6 +451,119 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
     res.json({ profile: mapProfileRow(profile) });
   } catch (err) {
     console.error('Error in PUT /me/profile', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------- Preferences endpoints (Step 2) ----------
+
+// Get my preferences
+app.get('/me/preferences', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM preferences WHERE user_id = $1',
+      [req.user.id]
+    );
+    const prefs = result.rows[0] || null;
+    res.json({ preferences: mapPreferencesRow(prefs) });
+  } catch (err) {
+    console.error('Error in GET /me/preferences', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create or update my preferences
+app.put('/me/preferences', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled in this environment' });
+  }
+
+  try {
+    const {
+      preferredGender,
+      minAge,
+      maxAge,
+      preferredReligions,
+      preferredSects,
+      preferredMaritalStatuses,
+      acceptHasChildren,
+      wantsChildren,
+      maxDistanceKm,
+      preferredCountries,
+      preferredCities,
+    } = req.body;
+
+    if (preferredGender && !['male', 'female'].includes(preferredGender)) {
+      return res.status(400).json({ error: 'preferredGender must be "male" or "female"' });
+    }
+
+    const religionsArr = Array.isArray(preferredReligions) ? preferredReligions : null;
+    const sectsArr = Array.isArray(preferredSects) ? preferredSects : null;
+    const maritalArr = Array.isArray(preferredMaritalStatuses) ? preferredMaritalStatuses : null;
+    const countriesArr = Array.isArray(preferredCountries) ? preferredCountries : null;
+    const citiesArr = Array.isArray(preferredCities) ? preferredCities : null;
+
+    const result = await pool.query(
+      `
+      INSERT INTO preferences (
+        user_id,
+        preferred_gender,
+        min_age,
+        max_age,
+        preferred_religions,
+        preferred_sects,
+        preferred_marital_statuses,
+        accept_has_children,
+        wants_children,
+        max_distance_km,
+        preferred_countries,
+        preferred_cities,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10, $11, $12, NOW(), NOW()
+      )
+      ON CONFLICT (user_id) DO UPDATE SET
+        preferred_gender = EXCLUDED.preferred_gender,
+        min_age = EXCLUDED.min_age,
+        max_age = EXCLUDED.max_age,
+        preferred_religions = EXCLUDED.preferred_religions,
+        preferred_sects = EXCLUDED.preferred_sects,
+        preferred_marital_statuses = EXCLUDED.preferred_marital_statuses,
+        accept_has_children = EXCLUDED.accept_has_children,
+        wants_children = EXCLUDED.wants_children,
+        max_distance_km = EXCLUDED.max_distance_km,
+        preferred_countries = EXCLUDED.preferred_countries,
+        preferred_cities = EXCLUDED.preferred_cities,
+        updated_at = NOW()
+      RETURNING *;
+      `,
+      [
+        req.user.id,
+        preferredGender || null,
+        typeof minAge === 'number' ? minAge : null,
+        typeof maxAge === 'number' ? maxAge : null,
+        religionsArr,
+        sectsArr,
+        maritalArr,
+        typeof acceptHasChildren === 'boolean' ? acceptHasChildren : null,
+        typeof wantsChildren === 'boolean' ? wantsChildren : null,
+        typeof maxDistanceKm === 'number' ? maxDistanceKm : null,
+        countriesArr,
+        citiesArr,
+      ]
+    );
+
+    const prefs = result.rows[0];
+    res.json({ preferences: mapPreferencesRow(prefs) });
+  } catch (err) {
+    console.error('Error in PUT /me/preferences', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
