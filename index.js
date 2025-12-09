@@ -1,18 +1,34 @@
 // index.js
 require('dotenv').config(); // loads .env for local dev
 
-const express = require('express');
+const cors = require('cors');
+const express = require('express-rate-limit');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
+
+// Allow mobile app / web client to call API
+app.use(cors());
 const port = process.env.PORT || 3000;
 const dbUrl = process.env.DATABASE_URL;
 const jwtSecret = process.env.JWT_SECRET;
 
 // Parse JSON bodies
 app.use(express.json());
+
+// Basic rate limiting: preven abuse
+const authlimiter = ratelimit({
+  windows: 60 * 1000, // 1 minute
+  max: 30,            // 30 swipes per minute
+});
+
+// Apply to auth routes
+app.use('/auth/', authlimiter);
+
+// Apply to swipte routes
+app.use('/swipes/', swipeLimiter);
 
 let pool = null;
 let dbEnabled = false;
@@ -932,7 +948,7 @@ app.get('/suggestions', authMiddleware, async (req, res) => {
     const suggestions = scored.map(({ row, score }) => ({
       userId: row.user_id,
       fullName: row.full_name,
-      email: row.email, // you may hide this later for privacy
+      // email intentionally omitted for privacy
       gender: row.gender,
       age: computeAge(row.date_of_birth),
       country: row.country,
