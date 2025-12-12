@@ -729,19 +729,21 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
   }
 
   try {
-    let {
-      preferredGender,
-      minAge,
-      maxAge,
-      preferredReligions,
-      preferredSects,
-      preferredMaritalStatuses,
-      acceptHasChildren,
-      wantsChildren,
-      maxDistanceKm,
-      preferredCountries,
-      preferredCities,
-    } = req.body;
+[
+  req.user.id,
+  preferredGender || null,
+  finalMinAge,
+  finalMaxAge,
+  religionsArr,
+  sectsArr,
+  maritalArr,
+  typeof acceptHasChildren === 'boolean' ? acceptHasChildren : null,
+  typeof wantsChildren === 'boolean' ? wantsChildren : null,
+  typeof maxDistanceKm === 'number' ? maxDistanceKm : null,
+  countriesArr,
+  citiesArr,
+]
+
 
     // We no longer use preferredGender for matching,
     // but if it comes in, keep it limited to male/female
@@ -751,23 +753,44 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
 
     // -------- 18+ BACKEND GUARD ON AGE PREFERENCES --------
     // Normalize to numbers if they came as strings
-    let minAgeNum =
-      typeof minAge === 'number' ? minAge : Number.parseInt(minAge, 10);
-    let maxAgeNum =
-      typeof maxAge === 'number' ? maxAge : Number.parseInt(maxAge, 10);
+    const minAgeNum =
+  minAge === undefined || minAge === null
+    ? null
+    : Number(minAge);
 
-    if (!Number.isNaN(minAgeNum) && minAgeNum < 18) {
-      return res.status(400).json({ error: 'minAge must be at least 18' });
-    }
+const maxAgeNum =
+  maxAge === undefined || maxAge === null
+    ? null
+    : Number(maxAge);
 
-    if (!Number.isNaN(maxAgeNum) && maxAgeNum < 18) {
-      return res.status(400).json({ error: 'maxAge must be at least 18' });
-    }
+// Reject non-numeric values
+if (minAgeNum !== null && !Number.isInteger(minAgeNum)) {
+  return res.status(400).json({ error: 'minAge must be a number' });
+}
+if (maxAgeNum !== null && !Number.isInteger(maxAgeNum)) {
+  return res.status(400).json({ error: 'maxAge must be a number' });
+}
 
-    // If both present and max < min, normalize: max = min
-    if (!Number.isNaN(minAgeNum) && !Number.isNaN(maxAgeNum) && maxAgeNum < minAgeNum) {
-      maxAgeNum = minAgeNum;
-    }
+// 🔒 HARD 18+ ENFORCEMENT
+if (minAgeNum !== null && minAgeNum < 18) {
+  return res.status(400).json({ error: 'minAge must be at least 18' });
+}
+if (maxAgeNum !== null && maxAgeNum < 18) {
+  return res.status(400).json({ error: 'maxAge must be at least 18' });
+}
+
+// Normalize min/max
+let finalMinAge = minAgeNum;
+let finalMaxAge = maxAgeNum;
+
+if (
+  finalMinAge !== null &&
+  finalMaxAge !== null &&
+  finalMaxAge < finalMinAge
+) {
+  finalMaxAge = finalMinAge;
+}
+
 
     // Prepare arrays
     const religionsArr = Array.isArray(preferredReligions) ? preferredReligions : null;
@@ -959,14 +982,11 @@ app.post('/swipes/pass', authMiddleware, async (req, res) => {
   }
 });
 
-// Get my matches
+// Get my matches (no conversations here)
 app.get('/matches', authMiddleware, async (req, res) => {
   if (!dbEnabled) {
-    return res.status(503).json({ error: 'Database not enabled in this environment' });
+    return res.status(503).json({ error: 'Database not enabled' });
   }
-
-  app.get('/conversations', authMiddleware, async (req, res) => {
-  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
 
   try {
     const userId = req.user.id;
@@ -975,26 +995,45 @@ app.get('/matches', authMiddleware, async (req, res) => {
       `
       SELECT
         m.id AS match_id,
-        c.id AS conversation_id,
         m.created_at AS matched_at,
-        CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END AS other_user_id,
-        u.full_name AS other_full_name,
-        u.email AS other_email
+        CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END AS other_user_id,
+        u.full_name AS other_full_name
       FROM matches m
-      LEFT JOIN conversations c ON c.match_id = m.id
-      JOIN users u ON u.id = CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END
+      JOIN users u
+        ON u.id = CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END
       WHERE m.user1_id = $1 OR m.user2_id = $1
       ORDER BY m.created_at DESC;
       `,
       [userId]
     );
 
-    res.json({ conversations: result.rows });
+    res.json({
+      matches: result.rows.map(r => ({
+        matchId: r.match_id,
+        matchedAt: r.matched_at,
+        user: {
+          id: r.other_user_id,
+          fullName: r.other_full_name
+        }
+      }))
+    });
   } catch (e) {
-    console.error('Error in GET /conversations', e);
+    console.error('Error in GET /matches', e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+-- OPTIONAL: enforce at DB level
+CREATE UNIQUE INDEX IF NOT EXISTS one_free_message_per_match
+ON messages (conversation_id, sender_id)
+WHERE sender_id IS NOT NULL;
+
 
 app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
@@ -1127,6 +1166,123 @@ app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Get conversations
+app.get('/conversations', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        m.id AS match_id,
+        c.id AS conversation_id,
+        m.created_at AS matched_at,
+        CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END AS other_user_id,
+        u.full_name AS other_full_name,
+        u.email AS other_email
+      FROM matches m
+      LEFT JOIN conversations c ON c.match_id = m.id
+      JOIN users u ON u.id = CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END
+      WHERE m.user1_id = $1 OR m.user2_id = $1
+      ORDER BY m.created_at DESC;
+      `,
+      [userId]
+    );
+
+    res.json({ conversations: result.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get messages
+app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+    const matchId = Number(req.params.matchId);
+
+    if (!(await userIsInMatch(userId, matchId))) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const conversationId = await getOrCreateConversation(matchId);
+
+    const msgs = await pool.query(
+      `
+      SELECT id, sender_id, body, created_at
+      FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at ASC;
+      `,
+      [conversationId]
+    );
+
+    res.json({ matchId, conversationId, messages: msgs.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send message
+app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+    const matchId = Number(req.params.matchId);
+    const { body } = req.body;
+
+    if (!body || body.trim().length === 0) {
+      return res.status(400).json({ error: 'Message body is required' });
+    }
+
+    if (!(await userIsInMatch(userId, matchId))) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const conversationId = await getOrCreateConversation(matchId);
+    const ent = await getEntitlement(userId);
+
+    if (!ent.isPremium) {
+      const count = await pool.query(
+        `SELECT COUNT(*)::int FROM messages WHERE conversation_id = $1 AND sender_id = $2`,
+        [conversationId, userId]
+      );
+
+      if (count.rows[0].cnt >= 1) {
+        return res.status(402).json({
+          error: 'Upgrade required: free members can only send 1 message per match.',
+          code: 'UPGRADE_REQUIRED'
+        });
+      }
+    }
+
+    const inserted = await pool.query(
+      `INSERT INTO messages (conversation_id, sender_id, body)
+       VALUES ($1, $2, $3)
+       RETURNING id, sender_id, body, created_at`,
+      [conversationId, userId, body.trim()]
+    );
+
+    res.status(201).json({
+      matchId,
+      conversationId,
+      message: inserted.rows[0],
+      entitlement: ent
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // ---------- Suggestions endpoint (matching engine) ----------
 
