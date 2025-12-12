@@ -1,34 +1,20 @@
 // index.js
 require('dotenv').config(); // loads .env for local dev
 
+const express = require('express');
 const cors = require('cors');
-const express = require('express-rate-limit');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-
-// Allow mobile app / web client to call API
-app.use(cors());
 const port = process.env.PORT || 3000;
 const dbUrl = process.env.DATABASE_URL;
 const jwtSecret = process.env.JWT_SECRET;
 
-// Parse JSON bodies
+// Parse JSON bodies + allow CORS
+app.use(cors());
 app.use(express.json());
-
-// Basic rate limiting: preven abuse
-const authlimiter = ratelimit({
-  windows: 60 * 1000, // 1 minute
-  max: 30,            // 30 swipes per minute
-});
-
-// Apply to auth routes
-app.use('/auth/', authlimiter);
-
-// Apply to swipte routes
-app.use('/swipes/', swipeLimiter);
 
 let pool = null;
 let dbEnabled = false;
@@ -39,18 +25,50 @@ if (dbUrl) {
     ssl: { rejectUnauthorized: false },
   });
   dbEnabled = true;
-  console.log('DATABASE_URL found, DB features enabled');
-} else {
-  console.log('No DATABASE_URL set, running WITHOUT database (local dev mode)');
 }
 
 if (!jwtSecret) {
   console.warn('⚠️ JWT_SECRET is not set. JWT features will not work correctly.');
 }
 
+
 // Ensure core tables exist (only if DB is enabled)
 async function ensureTables() {
   if (!dbEnabled) return;
+
+  // Entitlements (free/premium)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_entitlements (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      tier TEXT NOT NULL DEFAULT 'free' CHECK (tier IN ('free','premium')),
+      source TEXT NOT NULL DEFAULT 'admin' CHECK (source IN ('admin','android','ios','web')),
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Conversations (one per match)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id SERIAL PRIMARY KEY,
+      match_id INTEGER UNIQUE REFERENCES matches(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Messages
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+      sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+
 
   // Users table (auth basics)
   await pool.query(`
@@ -154,6 +172,29 @@ function generateToken(user) {
   );
 }
 
+async function getOrCreateConversation(matchId) {
+  const existing = await pool.query(
+    `SELECT id FROM conversations WHERE match_id = $1`,
+    [matchId]
+  );
+  if (existing.rowCount > 0) return existing.rows[0].id;
+
+  const created = await pool.query(
+    `INSERT INTO conversations (match_id) VALUES ($1) RETURNING id`,
+    [matchId]
+  );
+  return created.rows[0].id;
+}
+
+async function userIsInMatch(userId, matchId) {
+  const r = await pool.query(
+    `SELECT 1 FROM matches WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)`,
+    [matchId, userId]
+  );
+  return r.rowCount > 0;
+}
+
+
 async function findUserByEmail(email) {
   const result = await pool.query(
     'SELECT id, email, password_hash, full_name, created_at FROM users WHERE email = $1',
@@ -161,6 +202,23 @@ async function findUserByEmail(email) {
   );
   return result.rows[0] || null;
 }
+
+async function getEntitlement(userId) {
+  const r = await pool.query(
+    `SELECT tier, expires_at FROM user_entitlements WHERE user_id = $1`,
+    [userId]
+  );
+
+  // default to free if no row exists
+  if (r.rowCount === 0) return { tier: 'free', isPremium: false };
+
+  const { tier, expires_at } = r.rows[0];
+  const isPremium =
+    tier === 'premium' && (!expires_at || new Date(expires_at) > new Date());
+
+  return { tier, isPremium };
+}
+
 
 // Auth middleware to protect routes
 function authMiddleware(req, res, next) {
@@ -183,6 +241,51 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+
+// Get my entitlement
+app.get('/me/entitlement', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const ent = await getEntitlement(req.user.id);
+    res.json(ent);
+  } catch (e) {
+    console.error('Error in GET /me/entitlement', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// TEMP admin: set entitlement (remove/secure later!)
+app.post('/admin/entitlement', async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const { userId, tier, expiresAt } = req.body;
+    if (!userId || !['free','premium'].includes(tier)) {
+      return res.status(400).json({ error: 'userId and tier (free|premium) required' });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO user_entitlements (user_id, tier, source, expires_at, updated_at)
+      VALUES ($1, $2, 'admin', $3, NOW())
+      ON CONFLICT (user_id) DO UPDATE SET
+        tier = EXCLUDED.tier,
+        source = EXCLUDED.source,
+        expires_at = EXCLUDED.expires_at,
+        updated_at = NOW()
+      RETURNING user_id, tier, source, expires_at;
+      `,
+      [userId, tier, expiresAt || null]
+    );
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('Error in POST /admin/entitlement', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // Map DB profile row -> API response
 function mapProfileRow(row) {
@@ -260,8 +363,22 @@ function computeAge(dateOfBirth) {
 function computeMatchScore(myProfile, myPrefs, candidateProfile) {
   let score = 0;
 
-  // Hard constraints (return -1 if not acceptable)
+  // 🔒 Hard constraint 1: only opposite-gender matches
+  if (myProfile.gender && candidateProfile.gender) {
+    if (myProfile.gender === candidateProfile.gender) {
+      return -1; // do not match same gender
+    }
+  }
+
   const candidateAge = computeAge(candidateProfile.date_of_birth);
+
+  // 🔒 Hard constraint 2: never match anyone under 18
+  if (candidateAge != null && candidateAge < 18) {
+    return -1;
+  }
+
+  // 🔒 Hard constraints from preferences
+
   if (myPrefs.min_age != null && candidateAge != null && candidateAge < myPrefs.min_age) {
     return -1;
   }
@@ -269,9 +386,8 @@ function computeMatchScore(myProfile, myPrefs, candidateProfile) {
     return -1;
   }
 
-  if (myPrefs.preferred_gender && candidateProfile.gender) {
-    if (candidateProfile.gender !== myPrefs.preferred_gender) return -1;
-  }
+  // We are no longer using preferred_gender for matching
+  // (the matching is always opposite-gender now)
 
   if (myPrefs.preferred_religions && myPrefs.preferred_religions.length > 0) {
     if (!candidateProfile.religion || !myPrefs.preferred_religions.includes(candidateProfile.religion)) {
@@ -293,13 +409,13 @@ function computeMatchScore(myProfile, myPrefs, candidateProfile) {
     return -1;
   }
 
-  // Soft scoring
+  // -------- Soft scoring (same as before) --------
 
   // Age closeness
   if (candidateAge != null && myPrefs.min_age != null && myPrefs.max_age != null) {
     const mid = (myPrefs.min_age + myPrefs.max_age) / 2;
     const diff = Math.abs(candidateAge - mid);
-    score += Math.max(0, 20 - diff); // up to 20 points, less if far from ideal
+    score += Math.max(0, 20 - diff); // up to 20 points
   }
 
   // Same country / preferred countries
@@ -329,7 +445,7 @@ function computeMatchScore(myProfile, myPrefs, candidateProfile) {
   const candInterests = candidateProfile.interests || [];
   if (myInterests.length > 0 && candInterests.length > 0) {
     const overlap = myInterests.filter((i) => candInterests.includes(i));
-    score += overlap.length * 3; // 3 pts per shared interest
+    score += overlap.length * 3;
   }
 
   // Languages overlap
@@ -342,6 +458,7 @@ function computeMatchScore(myProfile, myPrefs, candidateProfile) {
 
   return score;
 }
+
 
 // ---------- Public endpoints ----------
 
@@ -605,32 +722,13 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
 // ---------- Preferences endpoints ----------
 
 // Get my preferences
-app.get('/me/preferences', authMiddleware, async (req, res) => {
-  if (!dbEnabled) {
-    return res.status(503).json({ error: 'Database not enabled in this environment' });
-  }
-
-  try {
-    const result = await pool.query(
-      'SELECT * FROM preferences WHERE user_id = $1',
-      [req.user.id]
-    );
-    const prefs = result.rows[0] || null;
-    res.json({ preferences: mapPreferencesRow(prefs) });
-  } catch (err) {
-    console.error('Error in GET /me/preferences', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create or update my preferences
 app.put('/me/preferences', authMiddleware, async (req, res) => {
   if (!dbEnabled) {
     return res.status(503).json({ error: 'Database not enabled in this environment' });
   }
 
   try {
-    const {
+    let {
       preferredGender,
       minAge,
       maxAge,
@@ -644,10 +742,33 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
       preferredCities,
     } = req.body;
 
+    // We no longer use preferredGender for matching,
+    // but if it comes in, keep it limited to male/female
     if (preferredGender && !['male', 'female'].includes(preferredGender)) {
       return res.status(400).json({ error: 'preferredGender must be "male" or "female"' });
     }
 
+    // -------- 18+ BACKEND GUARD ON AGE PREFERENCES --------
+    // Normalize to numbers if they came as strings
+    let minAgeNum =
+      typeof minAge === 'number' ? minAge : Number.parseInt(minAge, 10);
+    let maxAgeNum =
+      typeof maxAge === 'number' ? maxAge : Number.parseInt(maxAge, 10);
+
+    if (!Number.isNaN(minAgeNum) && minAgeNum < 18) {
+      return res.status(400).json({ error: 'minAge must be at least 18' });
+    }
+
+    if (!Number.isNaN(maxAgeNum) && maxAgeNum < 18) {
+      return res.status(400).json({ error: 'maxAge must be at least 18' });
+    }
+
+    // If both present and max < min, normalize: max = min
+    if (!Number.isNaN(minAgeNum) && !Number.isNaN(maxAgeNum) && maxAgeNum < minAgeNum) {
+      maxAgeNum = minAgeNum;
+    }
+
+    // Prepare arrays
     const religionsArr = Array.isArray(preferredReligions) ? preferredReligions : null;
     const sectsArr = Array.isArray(preferredSects) ? preferredSects : null;
     const maritalArr = Array.isArray(preferredMaritalStatuses) ? preferredMaritalStatuses : null;
@@ -694,8 +815,8 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
       [
         req.user.id,
         preferredGender || null,
-        typeof minAge === 'number' ? minAge : null,
-        typeof maxAge === 'number' ? maxAge : null,
+        !Number.isNaN(minAgeNum) ? minAgeNum : null,
+        !Number.isNaN(maxAgeNum) ? maxAgeNum : null,
         religionsArr,
         sectsArr,
         maritalArr,
@@ -714,6 +835,7 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // ---------- Likes / Passes / Matches endpoints ----------
 
@@ -841,6 +963,134 @@ app.get('/matches', authMiddleware, async (req, res) => {
   if (!dbEnabled) {
     return res.status(503).json({ error: 'Database not enabled in this environment' });
   }
+
+  app.get('/conversations', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        m.id AS match_id,
+        c.id AS conversation_id,
+        m.created_at AS matched_at,
+        CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END AS other_user_id,
+        u.full_name AS other_full_name,
+        u.email AS other_email
+      FROM matches m
+      LEFT JOIN conversations c ON c.match_id = m.id
+      JOIN users u ON u.id = CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END
+      WHERE m.user1_id = $1 OR m.user2_id = $1
+      ORDER BY m.created_at DESC;
+      `,
+      [userId]
+    );
+
+    res.json({ conversations: result.rows });
+  } catch (e) {
+    console.error('Error in GET /conversations', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+    const matchId = Number.parseInt(req.params.matchId, 10);
+    if (!Number.isFinite(matchId)) return res.status(400).json({ error: 'Invalid matchId' });
+
+    const ok = await userIsInMatch(userId, matchId);
+    if (!ok) return res.status(403).json({ error: 'Not allowed' });
+
+    const conversationId = await getOrCreateConversation(matchId);
+
+    const msgs = await pool.query(
+      `
+      SELECT id, sender_id, body, created_at
+      FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at ASC
+      LIMIT 200;
+      `,
+      [conversationId]
+    );
+
+    res.json({ matchId, conversationId, messages: msgs.rows });
+  } catch (e) {
+    console.error('Error in GET /matches/:matchId/messages', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+    const matchId = Number.parseInt(req.params.matchId, 10);
+    if (!Number.isFinite(matchId)) return res.status(400).json({ error: 'Invalid matchId' });
+
+    const { body } = req.body;
+    if (!body || typeof body !== 'string' || body.trim().length === 0) {
+      return res.status(400).json({ error: 'Message body is required' });
+    }
+    if (body.length > 2000) {
+      return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
+    }
+
+    const ok = await userIsInMatch(userId, matchId);
+    if (!ok) return res.status(403).json({ error: 'Not allowed' });
+
+    const conversationId = await getOrCreateConversation(matchId);
+
+    // Entitlement check
+    const ent = await getEntitlement(userId);
+
+    if (!ent.isPremium) {
+      // Free users: allow only 1 message PER MATCH total (their first message)
+      const count = await pool.query(
+        `
+        SELECT COUNT(*)::int AS cnt
+        FROM messages
+        WHERE conversation_id = $1 AND sender_id = $2
+        `,
+        [conversationId, userId]
+      );
+
+      if (count.rows[0].cnt >= 1) {
+        return res.status(402).json({
+          error: 'Upgrade required: free members can only send 1 message per match.',
+          code: 'UPGRADE_REQUIRED'
+        });
+      }
+    }
+
+    const inserted = await pool.query(
+      `
+      INSERT INTO messages (conversation_id, sender_id, body)
+      VALUES ($1, $2, $3)
+      RETURNING id, sender_id, body, created_at;
+      `,
+      [conversationId, userId, body.trim()]
+    );
+
+    res.status(201).json({
+      matchId,
+      conversationId,
+      message: inserted.rows[0],
+      entitlement: ent
+    });
+  } catch (e) {
+    console.error('Error in POST /matches/:matchId/messages', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
 
   try {
     const currentUserId = req.user.id;
