@@ -728,19 +728,21 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
   }
 
   try {
-    let {
-      preferredGender,
-      minAge,
-      maxAge,
-      preferredReligions,
-      preferredSects,
-      preferredMaritalStatuses,
-      acceptHasChildren,
-      wantsChildren,
-      maxDistanceKm,
-      preferredCountries,
-      preferredCities,
-    } = req.body;
+[
+  req.user.id,
+  preferredGender || null,
+  finalMinAge,
+  finalMaxAge,
+  religionsArr,
+  sectsArr,
+  maritalArr,
+  typeof acceptHasChildren === 'boolean' ? acceptHasChildren : null,
+  typeof wantsChildren === 'boolean' ? wantsChildren : null,
+  typeof maxDistanceKm === 'number' ? maxDistanceKm : null,
+  countriesArr,
+  citiesArr,
+]
+
 
     // We no longer use preferredGender for matching,
     // but if it comes in, keep it limited to male/female
@@ -750,23 +752,44 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
 
     // -------- 18+ BACKEND GUARD ON AGE PREFERENCES --------
     // Normalize to numbers if they came as strings
-    let minAgeNum =
-      typeof minAge === 'number' ? minAge : Number.parseInt(minAge, 10);
-    let maxAgeNum =
-      typeof maxAge === 'number' ? maxAge : Number.parseInt(maxAge, 10);
+    const minAgeNum =
+  minAge === undefined || minAge === null
+    ? null
+    : Number(minAge);
 
-    if (!Number.isNaN(minAgeNum) && minAgeNum < 18) {
-      return res.status(400).json({ error: 'minAge must be at least 18' });
-    }
+const maxAgeNum =
+  maxAge === undefined || maxAge === null
+    ? null
+    : Number(maxAge);
 
-    if (!Number.isNaN(maxAgeNum) && maxAgeNum < 18) {
-      return res.status(400).json({ error: 'maxAge must be at least 18' });
-    }
+// Reject non-numeric values
+if (minAgeNum !== null && !Number.isInteger(minAgeNum)) {
+  return res.status(400).json({ error: 'minAge must be a number' });
+}
+if (maxAgeNum !== null && !Number.isInteger(maxAgeNum)) {
+  return res.status(400).json({ error: 'maxAge must be a number' });
+}
 
-    // If both present and max < min, normalize: max = min
-    if (!Number.isNaN(minAgeNum) && !Number.isNaN(maxAgeNum) && maxAgeNum < minAgeNum) {
-      maxAgeNum = minAgeNum;
-    }
+// 🔒 HARD 18+ ENFORCEMENT
+if (minAgeNum !== null && minAgeNum < 18) {
+  return res.status(400).json({ error: 'minAge must be at least 18' });
+}
+if (maxAgeNum !== null && maxAgeNum < 18) {
+  return res.status(400).json({ error: 'maxAge must be at least 18' });
+}
+
+// Normalize min/max
+let finalMinAge = minAgeNum;
+let finalMaxAge = maxAgeNum;
+
+if (
+  finalMinAge !== null &&
+  finalMaxAge !== null &&
+  finalMaxAge < finalMinAge
+) {
+  finalMaxAge = finalMinAge;
+}
+
 
     // Prepare arrays
     const religionsArr = Array.isArray(preferredReligions) ? preferredReligions : null;
@@ -958,14 +981,11 @@ app.post('/swipes/pass', authMiddleware, async (req, res) => {
   }
 });
 
-// Get my matches
+// Get my matches (no conversations here)
 app.get('/matches', authMiddleware, async (req, res) => {
   if (!dbEnabled) {
-    return res.status(503).json({ error: 'Database not enabled in this environment' });
+    return res.status(503).json({ error: 'Database not enabled' });
   }
-
-  app.get('/conversations', authMiddleware, async (req, res) => {
-  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
 
   try {
     const userId = req.user.id;
@@ -974,26 +994,45 @@ app.get('/matches', authMiddleware, async (req, res) => {
       `
       SELECT
         m.id AS match_id,
-        c.id AS conversation_id,
         m.created_at AS matched_at,
-        CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END AS other_user_id,
-        u.full_name AS other_full_name,
-        u.email AS other_email
+        CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END AS other_user_id,
+        u.full_name AS other_full_name
       FROM matches m
-      LEFT JOIN conversations c ON c.match_id = m.id
-      JOIN users u ON u.id = CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END
+      JOIN users u
+        ON u.id = CASE
+          WHEN m.user1_id = $1 THEN m.user2_id
+          ELSE m.user1_id
+        END
       WHERE m.user1_id = $1 OR m.user2_id = $1
       ORDER BY m.created_at DESC;
       `,
       [userId]
     );
 
-    res.json({ conversations: result.rows });
+    res.json({
+      matches: result.rows.map(r => ({
+        matchId: r.match_id,
+        matchedAt: r.matched_at,
+        user: {
+          id: r.other_user_id,
+          fullName: r.other_full_name
+        }
+      }))
+    });
   } catch (e) {
-    console.error('Error in GET /conversations', e);
+    console.error('Error in GET /matches', e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+-- OPTIONAL: enforce at DB level
+CREATE UNIQUE INDEX IF NOT EXISTS one_free_message_per_match
+ON messages (conversation_id, sender_id)
+WHERE sender_id IS NOT NULL;
+
 
 app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
