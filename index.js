@@ -1,3 +1,4 @@
+// 🔥 messaging route cleanup commit test
 // index.js
 require('dotenv').config(); // loads .env for local dev
 
