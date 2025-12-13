@@ -723,10 +723,48 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
 // ---------- Preferences endpoints ----------
 
 // Get my preferences
-app.put('/me/preferences', authMiddleware, async (req, res) => {
+app.get('/me/preferences', authMiddleware, async (req, res) => {
   if (!dbEnabled) {
-    return res.status(503).json({ error: 'Database not enabled in this environment' });
+    return res.status(503).json({ error: 'Database not enabled' });
   }
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM preferences WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    const prefs = result.rows[0] || null;
+    res.json({ preferences: mapPreferencesRow(prefs) });
+  } catch (err) {
+    console.error('Error in GET /me/preferences', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+ // Get my preferences
+app.get('/me/preferences', authMiddleware, async (req, res) => {
+  if (!dbEnabled) {
+    return res.status(503).json({ error: 'Database not enabled' });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM preferences WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    const prefs = result.rows[0] || null;
+
+    res.json({
+      preferences: prefs ? mapPreferencesRow(prefs) : null
+    });
+  } catch (err) {
+    console.error('Error in GET /me/preferences', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
   try {
 [
