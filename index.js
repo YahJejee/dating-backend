@@ -888,13 +888,13 @@ app.get('/me/preferences', authMiddleware, async (req, res) => {
     return res.status(503).json({ error: 'Database not enabled' });
   }
 
-// Update my preferences
-app.put('/me/preferences', authMiddleware, async (req, res) => {
-  if (!dbEnabled) {
-    return res.status(503).json({ error: 'Database not enabled' });
-  }
 
-  try {
+
+// Update my preferences
+
+
+   
+  
     const {
       preferredGender,
       minAge,
@@ -910,9 +910,7 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
     } = req.body;
 
     // Validate preferredGender if provided
-    if (preferredGender && !['male', 'female'].includes(preferredGender)) {
-      return res.status(400).json({ error: 'preferredGender must be "male" or "female"' });
-    }
+    
 
     // -------- 18+ BACKEND GUARD --------
     const minAgeNum =
@@ -1006,11 +1004,11 @@ app.put('/me/preferences', authMiddleware, async (req, res) => {
     );
 
     res.json({ preferences: mapPreferencesRow(result.rows[0]) });
-  } catch (err) {
+ 
     console.error('Error in PUT /me/preferences', err);
     res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  
+
 
 
   try {
