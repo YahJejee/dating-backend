@@ -20,10 +20,14 @@ app.use(express.json());
 let pool = null;
 let dbEnabled = false;
 
+const isProd = process.env.NODE_ENV === 'production';
+
 if (dbUrl) {
   pool = new Pool({
     connectionString: dbUrl,
-    ssl: { rejectUnauthorized: false },
+    ssl: isProd
+      ? { rejectUnauthorized: false }
+      : false,
   });
   dbEnabled = true;
 }
