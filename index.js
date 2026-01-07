@@ -38,6 +38,14 @@ if (dbUrl) {
 
   dbEnabled = true;
 }
+console.log('DB_DEBUG', {
+  isProd,
+  hasDbUrl: !!dbUrl,
+  hasCaCert: !!caCert,
+  urlHasSslmode: /sslmode=/i.test(dbUrl || ''),
+  sslRejectUnauthorized:
+    isProd ? (caCert ? true : false) : null
+});
 
 if (!jwtSecret) {
   console.warn('⚠️ JWT_SECRET is not set. JWT features will not work correctly.');
