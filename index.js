@@ -36,15 +36,7 @@ if (dbUrl) {
       : false,
   });
   
-console.log('DB_DEBUG', {
-  isProd,
-  hasDbUrl: !!dbUrl,
-  hasCaCert: !!caCert,
-  urlHasSslmode: /sslmode=/i.test(dbUrl || ''),
-  sslRejectUnauthorized:
-    isProd ? (caCert ? true : false) : null
-});
-  
+ 
   dbEnabled = true;
 }
 
