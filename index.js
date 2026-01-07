@@ -7,6 +7,10 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -16,6 +20,26 @@ const jwtSecret = process.env.JWT_SECRET;
 // Parse JSON bodies + allow CORS
 app.use(cors());
 app.use(express.json());
+const s3Bucket = process.env.S3_BUCKET_NAME;
+const s3Region = process.env.AWS_REGION;
+const s3Prefix = process.env.S3_PREFIX || 'profiles/';
+
+const s3Enabled = !!(s3Bucket && s3Region && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+
+const s3 = s3Enabled
+  ? new S3Client({
+      region: s3Region,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    })
+  : null;
+
+if (!s3Enabled) {
+  console.warn('⚠️ S3 is not configured. Photo upload features will be disabled.');
+}
+
 
 let pool = null;
 let dbEnabled = false;
@@ -174,6 +198,47 @@ async function ensureTables() {
 }
 
 // ---------- Helper functions ----------
+
+function extFromContentType(ct) {
+  if (!ct) return 'bin';
+  const c = ct.toLowerCase();
+  if (c.includes('jpeg')) return 'jpg';
+  if (c.includes('png')) return 'png';
+  if (c.includes('webp')) return 'webp';
+  return 'bin';
+}
+
+async function countUserPhotos(userId) {
+  const r = await pool.query(
+    `SELECT COUNT(*)::int AS cnt FROM user_photos WHERE user_id = $1`,
+    [userId]
+  );
+  return r.rows[0].cnt;
+}
+
+async function ensurePrimaryIfNone(userId) {
+  const r = await pool.query(
+    `SELECT 1 FROM user_photos WHERE user_id = $1 AND is_primary = TRUE LIMIT 1`,
+    [userId]
+  );
+  if (r.rowCount > 0) return;
+
+  await pool.query(
+    `
+    WITH first_photo AS (
+      SELECT id FROM user_photos
+      WHERE user_id = $1
+      ORDER BY created_at ASC, id ASC
+      LIMIT 1
+    )
+    UPDATE user_photos
+    SET is_primary = TRUE
+    WHERE id IN (SELECT id FROM first_photo);
+    `,
+    [userId]
+  );
+}
+
 
 function generateToken(user) {
   if (!jwtSecret) {
@@ -729,6 +794,88 @@ app.put('/me/profile', authMiddleware, async (req, res) => {
     res.json({ profile: mapProfileRow(profile) });
   } catch (err) {
     console.error('Error in PUT /me/profile', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create a presigned URL for uploading a profile photo
+app.post('/photos/presign', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+  if (!s3Enabled) return res.status(503).json({ error: 'S3 not configured' });
+
+  try {
+    const userId = req.user.id;
+
+    const { contentType, bytes } = req.body;
+    if (!contentType || typeof contentType !== 'string') {
+      return res.status(400).json({ error: 'contentType is required' });
+    }
+
+    // Enforce max 6 total photos per user
+    const existingCount = await countUserPhotos(userId);
+    if (existingCount >= 6) {
+      return res.status(400).json({ error: 'Maximum of 6 photos reached' });
+    }
+
+    const ext = extFromContentType(contentType);
+    const key = `${s3Prefix}${userId}/${crypto.randomUUID()}.${ext}`;
+
+    const cmd = new PutObjectCommand({
+      Bucket: s3Bucket,
+      Key: key,
+      ContentType: contentType,
+      // Private bucket; access via presigned GET later
+    });
+
+    const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 60 * 5 }); // 5 min
+
+    res.json({
+      uploadUrl,
+      s3Key: key,
+      bucket: s3Bucket,
+      expiresInSeconds: 300,
+    });
+  } catch (e) {
+    console.error('Error in POST /photos/presign', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Confirm upload + store metadata in DB
+app.post('/photos/confirm', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+  if (!s3Enabled) return res.status(503).json({ error: 'S3 not configured' });
+
+  try {
+    const userId = req.user.id;
+    const { s3Key, contentType, bytes } = req.body;
+
+    if (!s3Key || typeof s3Key !== 'string') {
+      return res.status(400).json({ error: 's3Key is required' });
+    }
+
+    // Enforce max 6 total photos per user
+    const existingCount = await countUserPhotos(userId);
+    if (existingCount >= 6) {
+      return res.status(400).json({ error: 'Maximum of 6 photos reached' });
+    }
+
+    const inserted = await pool.query(
+      `
+      INSERT INTO user_photos (user_id, s3_key, content_type, bytes, is_primary)
+      VALUES ($1, $2, $3, $4,
+        CASE WHEN (SELECT COUNT(*) FROM user_photos WHERE user_id = $1) = 0 THEN TRUE ELSE FALSE END
+      )
+      RETURNING id, user_id, s3_key, content_type, bytes, is_primary, created_at;
+      `,
+      [userId, s3Key, contentType || null, Number.isFinite(bytes) ? bytes : null]
+    );
+
+    await ensurePrimaryIfNone(userId);
+
+    res.status(201).json({ photo: inserted.rows[0] });
+  } catch (e) {
+    console.error('Error in POST /photos/confirm', e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
