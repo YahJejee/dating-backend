@@ -35,9 +35,7 @@ if (dbUrl) {
           : { rejectUnauthorized: false }) // fallback if CA not set yet
       : false,
   });
-
-  dbEnabled = true;
-}
+  
 console.log('DB_DEBUG', {
   isProd,
   hasDbUrl: !!dbUrl,
@@ -46,6 +44,10 @@ console.log('DB_DEBUG', {
   sslRejectUnauthorized:
     isProd ? (caCert ? true : false) : null
 });
+  
+  dbEnabled = true;
+}
+
 
 if (!jwtSecret) {
   console.warn('⚠️ JWT_SECRET is not set. JWT features will not work correctly.');
