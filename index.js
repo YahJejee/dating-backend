@@ -23,12 +23,19 @@ let dbEnabled = false;
 const isProd = process.env.NODE_ENV === 'production';
 
 if (dbUrl) {
+  // Supports either real multiline cert OR cert pasted with "\n"
+  const caCertRaw = process.env.DATABASE_CA_CERT;
+  const caCert = caCertRaw ? caCertRaw.replace(/\\n/g, '\n') : undefined;
+
   pool = new Pool({
     connectionString: dbUrl,
     ssl: isProd
-      ? { rejectUnauthorized: false }
+      ? (caCert
+          ? { rejectUnauthorized: true, ca: caCert }
+          : { rejectUnauthorized: false }) // fallback if CA not set yet
       : false,
   });
+
   dbEnabled = true;
 }
 
