@@ -880,6 +880,52 @@ app.post('/photos/confirm', authMiddleware, async (req, res) => {
   }
 });
 
+// List my photos (returns presigned GET URLs)
+app.get('/me/photos', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+  if (!s3Enabled) return res.status(503).json({ error: 'S3 not configured' });
+
+  try {
+    const userId = req.user.id;
+
+    const r = await pool.query(
+      `
+      SELECT id, user_id, s3_key, content_type, bytes, is_primary, created_at
+      FROM user_photos
+      WHERE user_id = $1
+      ORDER BY is_primary DESC, created_at DESC, id DESC;
+      `,
+      [userId]
+    );
+
+    const photos = await Promise.all(
+      r.rows.map(async (row) => {
+        const cmd = new GetObjectCommand({
+          Bucket: s3Bucket,
+          Key: row.s3_key,
+        });
+
+        const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 10 }); // 10 min
+
+        return {
+          id: row.id,
+          userId: row.user_id,
+          s3Key: row.s3_key,
+          contentType: row.content_type,
+          bytes: row.bytes,
+          isPrimary: row.is_primary,
+          createdAt: row.created_at,
+          url,
+        };
+      })
+    );
+
+    res.json({ photos });
+  } catch (e) {
+    console.error('Error in GET /me/photos', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 
  // Get my preferences
