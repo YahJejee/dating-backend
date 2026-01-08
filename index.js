@@ -927,6 +927,49 @@ app.get('/me/photos', authMiddleware, async (req, res) => {
   }
 });
 
+// Set a photo as my primary photo
+app.post('/photos/:photoId/primary', authMiddleware, async (req, res) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
+
+  try {
+    const userId = req.user.id;
+    const photoId = Number.parseInt(req.params.photoId, 10);
+    if (!Number.isFinite(photoId)) return res.status(400).json({ error: 'Invalid photoId' });
+
+    // Ensure the photo belongs to this user
+    const owned = await pool.query(
+      `SELECT id FROM user_photos WHERE id = $1 AND user_id = $2`,
+      [photoId, userId]
+    );
+    if (owned.rowCount === 0) {
+      return res.status(404).json({ error: 'Photo not found' });
+    }
+
+    await pool.query('BEGIN');
+
+    // Clear existing primary
+    await pool.query(
+      `UPDATE user_photos SET is_primary = FALSE WHERE user_id = $1`,
+      [userId]
+    );
+
+    // Set selected
+    const updated = await pool.query(
+      `UPDATE user_photos SET is_primary = TRUE WHERE id = $1 AND user_id = $2
+       RETURNING id, user_id, s3_key, content_type, bytes, is_primary, created_at;`,
+      [photoId, userId]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({ photo: updated.rows[0] });
+  } catch (e) {
+    try { await pool.query('ROLLBACK'); } catch (_) {}
+    console.error('Error in POST /photos/:photoId/primary', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
  // Get my preferences
 app.get('/me/preferences', authMiddleware, async (req, res) => {
