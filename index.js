@@ -40,6 +40,18 @@ if (!s3Enabled) {
   console.warn('⚠️ S3 is not configured. Photo upload features will be disabled.');
 }
 
+const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET;
+
+async function presignGetUrl(s3Key, expiresInSeconds = 300) {
+  if (!S3_BUCKET) throw new Error('S3_BUCKET is not set');
+  const cmd = new GetObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: s3Key,
+  });
+  return await getSignedUrl(s3, cmd, { expiresIn: expiresInSeconds });
+}
+
+
 
 let pool = null;
 let dbEnabled = false;
