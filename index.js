@@ -220,6 +220,20 @@ function extFromContentType(ct) {
   return 'bin';
 }
 
+async function presignGetPhotoUrl(s3Key) {
+  if (!s3Key) return null;
+  if (!s3Client || !S3_BUCKET_NAME) return null;
+
+  const cmd = new GetObjectCommand({
+    Bucket: S3_BUCKET_NAME,
+    Key: s3Key,
+  });
+
+  // 5 minutes is fine; you can bump later if you want
+  return await getSignedUrl(s3Client, cmd, { expiresIn: 300 });
+}
+
+
 async function countUserPhotos(userId) {
   const r = await pool.query(
     `SELECT COUNT(*)::int AS cnt FROM user_photos WHERE user_id = $1`,
@@ -1571,25 +1585,34 @@ app.get('/suggestions', authMiddleware, async (req, res) => {
     // - users I've already passed
     const candidatesResult = await pool.query(
       `
-      SELECT
-        u.id AS user_id,
-        u.email,
-        u.full_name,
-        p.*
-      FROM users u
-      JOIN profiles p ON p.user_id = u.id
-      WHERE u.id != $1
-        AND NOT EXISTS (
-          SELECT 1 FROM likes l
-          WHERE l.liker_id = $1 AND l.liked_id = u.id
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM passes ps
-          WHERE ps.user_id = $1 AND ps.target_user_id = u.id
-        );
-      `,
-      [currentUserId]
+  SELECT
+    u.id AS user_id,
+    u.email,
+    u.full_name,
+    p.*,
+    ph.s3_key AS primary_s3_key
+  FROM users u
+  JOIN profiles p ON p.user_id = u.id
+  LEFT JOIN LATERAL (
+    SELECT s3_key
+    FROM user_photos
+    WHERE user_id = u.id AND is_primary = true
+    ORDER BY created_at DESC
+    LIMIT 1
+  ) ph ON true
+  WHERE u.id != $1
+    AND NOT EXISTS (
+      SELECT 1 FROM likes l
+      WHERE l.liker_id = $1 AND l.liked_id = u.id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM passes ps
+      WHERE ps.user_id = $1 AND ps.target_user_id = u.id
     );
+  `,
+  [currentUserId]
+);
+
 
     const candidates = candidatesResult.rows;
 
@@ -1603,26 +1626,32 @@ app.get('/suggestions', authMiddleware, async (req, res) => {
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
 
-    const suggestions = scored.map(({ row, score }) => ({
-      userId: row.user_id,
-      fullName: row.full_name,
-      // email intentionally omitted for privacy
-      gender: row.gender,
-      age: computeAge(row.date_of_birth),
-      country: row.country,
-      city: row.city,
-      religion: row.religion,
-      sect: row.sect,
-      maritalStatus: row.marital_status,
-      hasChildren: row.has_children,
-      wantsChildren: row.wants_children,
-      interests: row.interests || [],
-      languages: row.languages || [],
-      bio: row.bio,
-      matchScore: score,
-    }));
+    const suggestions = await Promise.all(
+  scored.map(async ({ row, score }) => ({
+    userId: row.user_id,
+    fullName: row.full_name,
+    gender: row.gender,
+    age: computeAge(row.date_of_birth),
+    country: row.country,
+    city: row.city,
+    religion: row.religion,
+    sect: row.sect,
+    maritalStatus: row.marital_status,
+    hasChildren: row.has_children,
+    wantsChildren: row.wants_children,
+    interests: row.interests || [],
+    languages: row.languages || [],
+    bio: row.bio,
+    matchScore: score,
 
-    res.json({ suggestions });
+    // ✅ NEW:
+    primaryPhotoKey: row.primary_s3_key || null,
+    primaryPhotoUrl: await presignGetPhotoUrl(row.primary_s3_key),
+  }))
+);
+
+res.json({ suggestions });
+
   } catch (err) {
     console.error('Error in GET /suggestions', err);
     res.status(500).json({ error: 'Internal server error' });
