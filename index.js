@@ -378,10 +378,6 @@ app.post('/photos/:photoId/primary', authMiddleware, async (req, res) => {
   }
 });
 
-Select-String -Path .\index.js -Pattern "photos/:photoId/primary" -SimpleMatch
-git status
-
-
 // Get my entitlement
 app.get('/me/entitlement', authMiddleware, async (req, res) => {
   if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
