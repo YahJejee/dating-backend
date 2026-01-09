@@ -405,6 +405,28 @@ app.get('/me/entitlement', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/debug/s3/exists', authMiddleware, async (req, res) => {
+  try {
+    const bucket = process.env.S3_BUCKET_NAME;
+    const key = String(req.query.key || '');
+
+    if (!bucket) return res.status(500).json({ error: 'S3_BUCKET_NAME not set' });
+    if (!key) return res.status(400).json({ error: 'Missing ?key=' });
+
+    const { HeadObjectCommand } = require('@aws-sdk/client-s3');
+    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+
+    res.json({ exists: true, bucket, key });
+  } catch (e) {
+    res.status(200).json({
+      exists: false,
+      message: e?.name || e?.message || String(e),
+    });
+  }
+});
+
+
+
 // TEMP admin: set entitlement (remove/secure later!)
 app.post('/admin/entitlement', async (req, res) => {
   if (!dbEnabled) return res.status(503).json({ error: 'Database not enabled' });
