@@ -377,7 +377,7 @@ app.post('/photos/:photoId/primary', authMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-cd C:\dating-backend
+
 Select-String -Path .\index.js -Pattern "photos/:photoId/primary" -SimpleMatch
 git status
 
