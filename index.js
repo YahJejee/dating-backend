@@ -1649,30 +1649,34 @@ app.get('/suggestions', authMiddleware, async (req, res) => {
       .slice(0, limit);
 
     const suggestions = await Promise.all(
-  scored.map(async ({ row, score }) => ({
-    userId: row.user_id,
-    fullName: row.full_name,
-    gender: row.gender,
-    age: computeAge(row.date_of_birth),
-    country: row.country,
-    city: row.city,
-    religion: row.religion,
-    sect: row.sect,
-    maritalStatus: row.marital_status,
-    hasChildren: row.has_children,
-    wantsChildren: row.wants_children,
-    interests: row.interests || [],
-    languages: row.languages || [],
-    bio: row.bio,
-    matchScore: score,
+  scored.map(async ({ row, score }) => {
+    const primaryKey = row.primary_s3_key || null;
 
-    // ✅ NEW:
-    primaryPhotoKey: row.primary_s3_key || null,
-    primaryPhotoUrl: await presignGetPhotoUrl(row.primary_s3_key),
-  }))
+    return {
+      userId: row.user_id,
+      fullName: row.full_name,
+      gender: row.gender,
+      age: computeAge(row.date_of_birth),
+      country: row.country,
+      city: row.city,
+      religion: row.religion,
+      sect: row.sect,
+      maritalStatus: row.marital_status,
+      hasChildren: row.has_children,
+      wantsChildren: row.wants_children,
+      interests: row.interests || [],
+      languages: row.languages || [],
+      bio: row.bio,
+      matchScore: score,
+
+      primaryPhotoKey: primaryKey,
+      primaryPhotoUrl: primaryKey ? await presignGetPhotoUrl(primaryKey) : null,
+    };
+  })
 );
 
 res.json({ suggestions });
+
 
   } catch (err) {
     console.error('Error in GET /suggestions', err);
