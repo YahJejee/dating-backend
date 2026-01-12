@@ -1669,8 +1669,9 @@ app.get('/suggestions', authMiddleware, async (req, res) => {
       bio: row.bio,
       matchScore: score,
 
-      primaryPhotoKey: primaryKey,
-      primaryPhotoUrl: primaryKey ? await presignGetPhotoUrl(primaryKey) : null,
+      primaryPhotoKey: row.primary_s3_key || null,
+      primaryPhotoUrl: row.primary_s3_key ? await presignGetPhotoUrl(row.primary_s3_key) : null,
+
     };
   })
 );
