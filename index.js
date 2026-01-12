@@ -8,8 +8,14 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION, // must be like: "us-east-2"
+  // credentials will be automatically read from env:
+  // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+});
+
 
 
 const app = express();
@@ -230,7 +236,7 @@ async function presignGetPhotoUrl(s3Key) {
   });
 
   // 5 minutes is fine; you can bump later if you want
-  return await getSignedUrl(s3Client, cmd, { expiresIn: 300 });
+  return await getSignedUrl(s3Client, cmd, { expiresIn: 600 });
 }
 
 
